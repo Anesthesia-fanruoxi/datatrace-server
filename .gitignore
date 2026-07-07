@@ -1,0 +1,44 @@
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ===== 操作系统 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+nul
+
+# ===== Go 编译产物 =====
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.prof
+vendor/
+
+# ===== 运行时产物 =====
+logs/
+server.log
+
+# ===== 数据库文件 =====
+*.db
+*.db-wal
+*.db-shm
+
+# ===== 敏感配置 =====
+*.pem
+*.key
+*.cert
+.env
+.env.*
+!.env.example
+
+# ===== 配置文件（含密码等敏感信息） =====
+config.yaml
+/migrations/003_cleanup_config_json.sql
