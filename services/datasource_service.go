@@ -27,13 +27,13 @@ func NewDataSourceService(db *gorm.DB, crypto *utils.CryptoService, credSvc *Cre
 // CreateDataSourceRequest 创建数据源请求
 type CreateDataSourceRequest struct {
 	Name         string  `json:"name" binding:"required"`
-	Type         string  `json:"type" binding:"required,oneof=mysql"`
+	Type         string  `json:"type" binding:"required,oneof=mysql mysql8"`
 	Host         string  `json:"host" binding:"required"`
 	Port         int     `json:"port" binding:"required,min=1,max=65535"`
 	CredentialID *string `json:"credential_id"`
 	Username     string  `json:"username"`
 	Password     string  `json:"password"`
-	DatabaseName string  `json:"database_name" binding:"required"`
+	DatabaseName string  `json:"database_name"`
 }
 
 // UpdateDataSourceRequest 更新数据源请求
@@ -59,21 +59,37 @@ func (s *DataSourceService) Create(req *CreateDataSourceRequest) (*models.DataSo
 		CredentialID: req.CredentialID,
 	}
 
-	// 如果没有指定凭据，使用用户名密码
-	if req.CredentialID == nil {
+	// 统一解析账号密码：无论使用凭据还是手动输入，都将明文密码加密后写入
+	// 数据源自身的 username/password 字段，下游逻辑（健康检查、连接查询）统一使用
+	var plainUsername, plainPassword string
+	if req.CredentialID != nil && *req.CredentialID != "" {
+		cred, err := s.credSvc.GetByIDWithPassword(*req.CredentialID)
+		if err != nil {
+			return nil, fmt.Errorf("获取凭据失败: %w", err)
+		}
+		decrypted, err := s.credSvc.DecryptPassword(cred)
+		if err != nil {
+			return nil, fmt.Errorf("解密凭据密码失败: %w", err)
+		}
+		plainUsername = cred.Username
+		plainPassword = decrypted
+	} else {
 		if req.Username == "" {
 			return nil, fmt.Errorf("用户名不能为空")
 		}
 		if req.Password == "" {
 			return nil, fmt.Errorf("密码不能为空")
 		}
-		ds.Username = req.Username
-		encryptedPwd, err := s.crypto.Encrypt(req.Password)
-		if err != nil {
-			return nil, fmt.Errorf("密码加密失败: %w", err)
-		}
-		ds.Password = encryptedPwd
+		plainUsername = req.Username
+		plainPassword = req.Password
 	}
+
+	encryptedPwd, err := s.crypto.Encrypt(plainPassword)
+	if err != nil {
+		return nil, fmt.Errorf("密码加密失败: %w", err)
+	}
+	ds.Username = plainUsername
+	ds.Password = encryptedPwd
 
 	if err := s.db.Create(ds).Error; err != nil {
 		return nil, fmt.Errorf("创建数据源失败: %w", err)
@@ -121,9 +137,35 @@ func (s *DataSourceService) Update(id string, req *UpdateDataSourceRequest) (*mo
 	if req.Port > 0 {
 		updates["port"] = req.Port
 	}
+	if req.DatabaseName != "" {
+		updates["database_name"] = req.DatabaseName
+	}
+
+	// 认证相关字段统一处理：无论使用凭据还是手动输入，
+	// 都将最终的账号密码写入数据源自身的 username/password 字段
 	if req.CredentialID != nil {
 		updates["credential_id"] = req.CredentialID
+		if *req.CredentialID != "" {
+			// 切换到凭据模式：从凭据获取账号密码并写入
+			cred, err := s.credSvc.GetByIDWithPassword(*req.CredentialID)
+			if err != nil {
+				return nil, fmt.Errorf("获取凭据失败: %w", err)
+			}
+			decrypted, err := s.credSvc.DecryptPassword(cred)
+			if err != nil {
+				return nil, fmt.Errorf("解密凭据密码失败: %w", err)
+			}
+			encryptedPwd, err := s.crypto.Encrypt(decrypted)
+			if err != nil {
+				return nil, fmt.Errorf("密码加密失败: %w", err)
+			}
+			updates["username"] = cred.Username
+			updates["password"] = encryptedPwd
+		}
+		// 切换到手动模式（credential_id=""）时：不在此处修改 username/password，
+		// 依靠下方的 req.Username / req.Password 分支处理
 	}
+
 	if req.Username != "" {
 		updates["username"] = req.Username
 	}
@@ -134,16 +176,16 @@ func (s *DataSourceService) Update(id string, req *UpdateDataSourceRequest) (*mo
 		}
 		updates["password"] = encryptedPwd
 	}
-	if req.DatabaseName != "" {
-		updates["database_name"] = req.DatabaseName
-	}
 	updates["updated_at"] = time.Now()
 
 	if err := s.db.Model(&ds).Updates(updates).Error; err != nil {
 		return nil, fmt.Errorf("更新数据源失败: %w", err)
 	}
 
-	ds.Password = "******"
+	// 重新加载以返回最新状态
+	if err := s.db.First(&ds, "id = ?", id).Error; err == nil {
+		ds.Password = "******"
+	}
 	return &ds, nil
 }
 
@@ -169,29 +211,10 @@ func (s *DataSourceService) TestConnection(id string) error {
 		return fmt.Errorf("数据源不存在: %w", err)
 	}
 
-	// 获取密码
-	var password string
-	if ds.CredentialID != nil && *ds.CredentialID != "" {
-		cred, err := s.credSvc.GetByIDWithPassword(*ds.CredentialID)
-		if err != nil {
-			return fmt.Errorf("获取凭据失败: %w", err)
-		}
-		decrypted, err := s.credSvc.DecryptPassword(cred)
-		if err != nil {
-			return fmt.Errorf("解密密码失败: %w", err)
-		}
-		password = decrypted
-	} else {
-		decrypted, err := s.crypto.Decrypt(ds.Password)
-		if err != nil {
-			return fmt.Errorf("解密密码失败: %w", err)
-		}
-		password = decrypted
+	dsn, err := s.GetConnectionDSN(&ds)
+	if err != nil {
+		return err
 	}
-
-	// 构建 DSN
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=Local",
-		ds.Username, password, ds.Host, ds.Port, ds.DatabaseName)
 
 	// 测试连接
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -211,26 +234,26 @@ func (s *DataSourceService) TestConnection(id string) error {
 }
 
 // GetConnectionDSN 获取数据源连接字符串（内部使用）
+// 统一使用数据源自身的 username/password（创建/更新时已将凭据物化到数据源）
 func (s *DataSourceService) GetConnectionDSN(ds *models.DataSource) (string, error) {
-	var password string
-	if ds.CredentialID != nil && *ds.CredentialID != "" {
+	// 兼容存量数据：如果 username 为空但有 credential_id，回退到从凭据读取
+	if ds.Username == "" && ds.CredentialID != nil && *ds.CredentialID != "" {
 		cred, err := s.credSvc.GetByIDWithPassword(*ds.CredentialID)
 		if err != nil {
 			return "", fmt.Errorf("获取凭据失败: %w", err)
 		}
 		decrypted, err := s.credSvc.DecryptPassword(cred)
 		if err != nil {
-			return "", fmt.Errorf("解密密码失败: %w", err)
+			return "", fmt.Errorf("解密凭据密码失败: %w", err)
 		}
-		password = decrypted
-	} else {
-		decrypted, err := s.crypto.Decrypt(ds.Password)
-		if err != nil {
-			return "", fmt.Errorf("解密密码失败: %w", err)
-		}
-		password = decrypted
+		return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=Local",
+			cred.Username, decrypted, ds.Host, ds.Port, ds.DatabaseName), nil
 	}
 
+	password, err := s.crypto.Decrypt(ds.Password)
+	if err != nil {
+		return "", fmt.Errorf("解密密码失败: %w", err)
+	}
 	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=Local",
 		ds.Username, password, ds.Host, ds.Port, ds.DatabaseName), nil
 }
@@ -368,4 +391,17 @@ func (s *DataSourceService) TestConnectionByPayload(host string, port int, usern
 		return fmt.Errorf("连接测试失败: %w", err)
 	}
 	return nil
+}
+
+// TestConnectionByCredential 通过凭据 ID 测试连接
+func (s *DataSourceService) TestConnectionByCredential(host string, port int, credentialID, databaseName string) error {
+	cred, err := s.credSvc.GetByIDWithPassword(credentialID)
+	if err != nil {
+		return fmt.Errorf("获取凭据失败: %w", err)
+	}
+	password, err := s.credSvc.DecryptPassword(cred)
+	if err != nil {
+		return fmt.Errorf("解密密码失败: %w", err)
+	}
+	return s.TestConnectionByPayload(host, port, cred.Username, password, databaseName)
 }

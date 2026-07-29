@@ -5,8 +5,8 @@ import (
 	"database/sql"
 	"datatrace/common"
 	"fmt"
-	"log"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -61,7 +61,7 @@ func (s *SyncInitializer) InitTargetTable(ctx context.Context, sourceDB, sourceT
 	// 字段过滤：如果指定了字段列表，过滤 DDL
 	if len(columns) > 0 {
 		ddl = filterDDLColumns(ddl, columns)
-		common.LogInfo("【InitTable】字段过滤: 保留 %d 个字段", len(columns))
+		common.LogDebug("【InitTable】字段过滤: 保留 %d 个字段", len(columns))
 	}
 
 	// 检查目标表是否存在
@@ -71,88 +71,96 @@ func (s *SyncInitializer) InitTargetTable(ctx context.Context, sourceDB, sourceT
 		common.LogError("【InitTable】❌ 检查目标表存在失败: %v", err)
 		return fmt.Errorf("检查目标表存在失败: %w", err)
 	}
-	common.LogInfo("【InitTable】目标表 %s.%s 存在状态: %v", targetDB, targetTable, exists)
+	common.LogDebug("【InitTable】目标表 %s.%s 存在状态: %v", targetDB, targetTable, exists)
 
 	switch strategy {
 	case "drop":
-		common.LogInfo("【InitTable】策略: drop, 表存在=%v", exists)
+		common.LogDebug("【InitTable】策略: drop, 表存在=%v", exists)
 		if exists {
-			common.LogInfo("【InitTable】正在删除目标表: %s.%s", targetDB, targetTable)
+			common.LogDebug("【InitTable】正在删除目标表: %s.%s", targetDB, targetTable)
 			if err := s.writer.DropTable(ctx, targetDB, targetTable); err != nil {
 				common.LogError("【InitTable】❌ 删除目标表失败: %v", err)
 				return fmt.Errorf("删除目标表失败: %w", err)
 			}
-			common.LogInfo("【InitTable】✅ 目标表已删除")
+			common.LogDebug("【InitTable】✅ 目标表已删除")
 		}
-		common.LogInfo("【InitTable】正在执行 DDL 创建表")
+		common.LogDebug("【InitTable】正在执行 DDL 创建表")
 		if err := s.writer.ExecDDL(ctx, ddl); err != nil {
 			common.LogError("【InitTable】❌ 创建表失败: %v", err)
 			return err
 		}
-		common.LogInfo("【InitTable】✅ 表创建成功")
+		common.LogDebug("【InitTable】✅ 表创建成功")
 
 	case "truncate":
-		common.LogInfo("【InitTable】策略: truncate, 表存在=%v", exists)
+		common.LogDebug("【InitTable】策略: truncate, 表存在=%v", exists)
 		if exists {
-			common.LogInfo("【InitTable】正在清空目标表: %s.%s", targetDB, targetTable)
+			common.LogDebug("【InitTable】正在清空目标表: %s.%s", targetDB, targetTable)
 			if err := s.writer.TruncateTable(ctx, targetDB, targetTable); err != nil {
 				common.LogError("【InitTable】❌ 清空目标表失败: %v", err)
 				return err
 			}
-			common.LogInfo("【InitTable】✅ 目标表已清空")
+			common.LogDebug("【InitTable】✅ 目标表已清空")
 		} else {
-			common.LogInfo("【InitTable】正在执行 DDL 创建表")
+			common.LogDebug("【InitTable】正在执行 DDL 创建表")
 			if err := s.writer.ExecDDL(ctx, ddl); err != nil {
 				common.LogError("【InitTable】❌ 创建表失败: %v", err)
 				return err
 			}
-			common.LogInfo("【InitTable】✅ 表创建成功")
+			common.LogDebug("【InitTable】✅ 表创建成功")
 		}
 
 	case "append":
-		common.LogInfo("【InitTable】策略: append, 表存在=%v", exists)
+		common.LogDebug("【InitTable】策略: append, 表存在=%v", exists)
 		if !exists {
-			common.LogInfo("【InitTable】正在执行 DDL 创建表")
+			common.LogDebug("【InitTable】正在执行 DDL 创建表")
 			if err := s.writer.ExecDDL(ctx, ddl); err != nil {
 				common.LogError("【InitTable】❌ 创建表失败: %v", err)
 				return err
 			}
-			common.LogInfo("【InitTable】✅ 表创建成功")
+			common.LogDebug("【InitTable】✅ 表创建成功")
 		} else {
-			common.LogInfo("【InitTable】⚠️ 表已存在，追加模式跳过创建")
+			common.LogDebug("【InitTable】⚠️ 表已存在，追加模式跳过创建")
 		}
 
 	case "structure_only":
-		common.LogInfo("【InitTable】策略: structure_only, 表存在=%v", exists)
+		common.LogDebug("【InitTable】策略: structure_only, 表存在=%v", exists)
 		if exists {
-			common.LogInfo("【InitTable】正在删除目标表: %s.%s", targetDB, targetTable)
+			common.LogDebug("【InitTable】正在删除目标表: %s.%s", targetDB, targetTable)
 			if err := s.writer.DropTable(ctx, targetDB, targetTable); err != nil {
 				common.LogError("【InitTable】❌ 删除目标表失败: %v", err)
 				return fmt.Errorf("删除目标表失败: %w", err)
 			}
-			common.LogInfo("【InitTable】✅ 目标表已删除")
+			common.LogDebug("【InitTable】✅ 目标表已删除")
 		}
-		common.LogInfo("【InitTable】正在执行 DDL 创建表（仅结构）")
+		common.LogDebug("【InitTable】正在执行 DDL 创建表（仅结构）")
 		if err := s.writer.ExecDDL(ctx, ddl); err != nil {
 			common.LogError("【InitTable】❌ 创建表失败: %v", err)
 			return err
 		}
-		common.LogInfo("【InitTable】✅ 表结构创建成功")
+		common.LogDebug("【InitTable】✅ 表结构创建成功")
 
 	default:
 		common.LogError("【InitTable】❌ 未知的表策略: %s", strategy)
 		return fmt.Errorf("未知的表策略: %s", strategy)
 	}
 
-	common.LogInfo("【InitTable】✅ 表 %s.%s 初始化完成", targetDB, targetTable)
+	common.LogDebug("【InitTable】✅ 表 %s.%s 初始化完成", targetDB, targetTable)
 	return nil
 }
 
-// InitAllTargets 初始化所有目标数据库和表（内部自动解析 DDL 外键依赖并拓扑排序建表）
-func (s *SyncInitializer) InitAllTargets(ctx context.Context, config *TaskConfig, targetDSN string, taskID string) error {
-	common.LogInfo("【SyncInit】开始初始化所有目标数据库和表")
-	common.LogInfo("【SyncInit】目标 DSN: %s", targetDSN)
-	common.LogInfo("【SyncInit】共 %d 个数据库映射", len(config.DatabaseMappings))
+// InitAllTargets 初始化目标数据库和表（内部自动解析 DDL 外键依赖并拓扑排序建表）
+// mappings 为当前目标的库表映射（多目标时已由调用方结合 TaskConfig.GetEffectiveMappings 解析），config 仅用于读取 SyncConfig 策略
+func (s *SyncInitializer) InitAllTargets(ctx context.Context, config *TaskConfig, mappings []DatabaseMapping, targetDSN string, taskID string) error {
+	common.LogInfo("【SyncInit】开始初始化目标库表（%d 个库映射）", len(mappings))
+	common.LogDebug("【SyncInit】目标 DSN: %s", targetDSN)
+
+	// 保护性检查：mappings 为空意味着任务配置与运行时解析不一致（旧格式字段空、多目标取错 targetID 等），
+	// 若直接空转会导致“没建库没建表但日志报完成”的假成功，必须直接报错
+	if len(mappings) == 0 {
+		common.LogError("【SyncInit】❌ 当前目标没有任何库表映射，可能是多目标配置中 target_id 不匹配或配置为空")
+		s.publishLog(taskID, "initialize", "❌ 当前目标没有任何库表映射，任务中止")
+		return fmt.Errorf("当前目标库表映射为空，无法初始化")
+	}
 
 	targetDB, err := sql.Open("mysql", targetDSN)
 	if err != nil {
@@ -164,18 +172,18 @@ func (s *SyncInitializer) InitAllTargets(ctx context.Context, config *TaskConfig
 	// 真正建立连接（sql.Open 是惰性的，必须 Ping 才能验证连通性）
 	pingCtx, pingCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer pingCancel()
-	common.LogInfo("【SyncInit】正在 Ping 目标库...")
+	common.LogDebug("【SyncInit】正在 Ping 目标库...")
 	if err := targetDB.PingContext(pingCtx); err != nil {
 		common.LogError("【SyncInit】❌ 目标库 Ping 失败: %v", err)
 		return fmt.Errorf("目标库连接失败（Ping 超时或错误）: %w", err)
 	}
-	common.LogInfo("【SyncInit】✅ 目标库 Ping 成功，连接正常")
+	common.LogDebug("【SyncInit】✅ 目标库 Ping 成功，连接正常")
 
 	targetWriter := NewMySQLWriter(targetDB)
 
 	// ─── 第一步：创建库 ───
 	s.publishLog(taskID, "initialize", "━━ 第一步：创建目标库 ━━")
-	for _, db := range config.DatabaseMappings {
+	for _, db := range mappings {
 		// 带超时保护
 		if _, diagErr := targetDB.ExecContext(ctx, "SELECT 1"); diagErr != nil {
 			common.LogError("【SyncInit】❌ 目标库连接诊断失败（SELECT 1）: %v", diagErr)
@@ -203,7 +211,8 @@ func (s *SyncInitializer) InitAllTargets(ctx context.Context, config *TaskConfig
 		strategy = "truncate"
 	}
 
-	// 构建 sourceTable -> tblInfo 的查找表
+	// 构建 tableKey(sourceDB.sourceTable) -> tblInfo 的查找表
+	// 必须包含源库名，否则多个源库同名表（如 undo_log）会互相覆盖导致只建一份
 	type tblInfo struct {
 		SourceDB    string
 		TargetDB    string
@@ -213,34 +222,62 @@ func (s *SyncInitializer) InitAllTargets(ctx context.Context, config *TaskConfig
 	}
 	tblMap := make(map[string]tblInfo)
 	var allTbls []string
-	for _, db := range config.DatabaseMappings {
+	for _, db := range mappings {
 		for _, tbl := range db.Tables {
-			key := tbl.SourceTable
+			key := TableKey(db.SourceDB, tbl.SourceTable)
 			tblMap[key] = tblInfo{db.SourceDB, db.TargetDB, tbl.SourceTable, tbl.TargetTable, tbl.Columns}
 			allTbls = append(allTbls, key)
 		}
 	}
 
-	// ─── 预获取所有 DDL 并解析外键依赖 ───
-	ddlMap := make(map[string]string) // sourceTable -> processed DDL
-	var ddlDeps []ddlDep              // 外键依赖关系
-	for _, srcTbl := range allTbls {
-		info := tblMap[srcTbl]
-		rawDDL, err := s.reader.GetCreateTableDDL(ctx, info.SourceDB, info.SourceTable)
-		if err != nil {
-			common.LogError("【SyncInit】❌ 获取 %s DDL 失败: %v", srcTbl, err)
-			return fmt.Errorf("获取表 %s DDL 失败: %w", srcTbl, err)
+	// ─── 预获取所有 DDL 并解析外键依赖（并发：SHOW CREATE TABLE 无副作用）───
+	ddlMap := make(map[string]string) // tableKey -> processed DDL
+	var ddlDeps []ddlDep              // 外键依赖关系（tableKey 级别）
+	{
+		type ddlResult struct {
+			key       string
+			processed string
+			refs      []string
 		}
-		// 替换库名表名 + 字段过滤
-		processedDDL := replaceTableRef(rawDDL, info.SourceDB, info.TargetDB, info.SourceTable, info.TargetTable)
-		if len(info.Columns) > 0 {
-			processedDDL = filterDDLColumns(processedDDL, info.Columns)
+		const ddlWorkers = 10
+		sem := make(chan struct{}, ddlWorkers)
+		resultCh := make(chan ddlResult, len(allTbls))
+		errCh := make(chan error, len(allTbls))
+		var wg sync.WaitGroup
+		for _, k := range allTbls {
+			info := tblMap[k]
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(key string, info tblInfo) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				rawDDL, err := s.reader.GetCreateTableDDL(ctx, info.SourceDB, info.SourceTable)
+				if err != nil {
+					errCh <- fmt.Errorf("获取表 %s DDL 失败: %w", key, err)
+					return
+				}
+				processedDDL := replaceTableRef(rawDDL, info.SourceDB, info.TargetDB, info.SourceTable, info.TargetTable)
+				if len(info.Columns) > 0 {
+					processedDDL = filterDDLColumns(processedDDL, info.Columns)
+				}
+				resultCh <- ddlResult{key: key, processed: processedDDL, refs: extractDDLReferences(processedDDL)}
+			}(k, info)
 		}
-		ddlMap[srcTbl] = processedDDL
-		// 解析 DDL 中的 REFERENCES 依赖
-		refs := extractDDLReferences(processedDDL)
-		for _, ref := range refs {
-			ddlDeps = append(ddlDeps, ddlDep{child: srcTbl, parent: ref})
+		wg.Wait()
+		close(resultCh)
+		close(errCh)
+		if err, ok := <-errCh; ok {
+			common.LogError("【SyncInit】❌ %v", err)
+			s.publishLog(taskID, "initialize", fmt.Sprintf("❌ 预获取表结构失败: %v", err))
+			return err
+		}
+		for r := range resultCh {
+			ddlMap[r.key] = r.processed
+			info := tblMap[r.key]
+			for _, ref := range r.refs {
+				parentKey := TableKey(info.SourceDB, ref)
+				ddlDeps = append(ddlDeps, ddlDep{child: r.key, parent: parentKey})
+			}
 		}
 	}
 
@@ -253,8 +290,8 @@ func (s *SyncInitializer) InitAllTargets(ctx context.Context, config *TaskConfig
 	// DROP/structure_only 策略：按逆拓扑序删表（子表先删，父表后删）
 	if strategy == "drop" || strategy == "structure_only" {
 		for i := len(buildOrder) - 1; i >= 0; i-- {
-			srcTbl := buildOrder[i]
-			info, ok := tblMap[srcTbl]
+			key := buildOrder[i]
+			info, ok := tblMap[key]
 			if !ok {
 				continue
 			}
@@ -265,24 +302,23 @@ func (s *SyncInitializer) InitAllTargets(ctx context.Context, config *TaskConfig
 		}
 	}
 
-	for i, srcTbl := range buildOrder {
-		info, ok := tblMap[srcTbl]
+	for _, key := range buildOrder {
+		info, ok := tblMap[key]
 		if !ok {
 			continue
 		}
-		ddl := ddlMap[srcTbl]
-		common.LogInfo("【SyncInit】  处理表 %d: %s.%s -> %s.%s", i+1, info.SourceDB, info.SourceTable, info.TargetDB, info.TargetTable)
+		ddl := ddlMap[key]
+		common.LogDebug("【SyncInit】  处理表: %s.%s -> %s.%s", info.SourceDB, info.SourceTable, info.TargetDB, info.TargetTable)
 
 		if err := s.execCreateTable(ctx, info.TargetDB, info.TargetTable, strategy, ddl); err != nil {
 			common.LogError("【SyncInit】❌ 初始化表 %s.%s 失败: %v", info.TargetDB, info.TargetTable, err)
-			log.Printf("[SyncInit] 初始化表 %s.%s 失败: %v", info.TargetDB, info.TargetTable, err)
 			s.publishLog(taskID, "initialize", fmt.Sprintf("创建表 %s 失败: %v", info.TargetTable, err))
 			return err
 		}
 		if info.TargetTable == info.SourceTable {
-			s.publishLog(taskID, "initialize", fmt.Sprintf("创建表 %s 成功", info.TargetTable))
+			s.publishLog(taskID, "initialize", fmt.Sprintf("创建表 %s.%s 成功", info.TargetDB, info.TargetTable))
 		} else {
-			s.publishLog(taskID, "initialize", fmt.Sprintf("创建表 %s（源表名：%s）成功", info.TargetTable, info.SourceTable))
+			s.publishLog(taskID, "initialize", fmt.Sprintf("创建表 %s.%s（源表名：%s）成功", info.TargetDB, info.TargetTable, info.SourceTable))
 		}
 	}
 

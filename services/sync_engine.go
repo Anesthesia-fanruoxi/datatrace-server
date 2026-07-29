@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"datatrace/common"
 	"fmt"
 	"log"
 	"sync"
@@ -73,7 +74,7 @@ func (e *SyncEngine) SyncTable(ctx context.Context, reader *MySQLReader, writer 
 
 	// 动态计算批次大小
 	batchSize = reader.EstimateBatchSize(ctx, sourceDB, sourceTable, batchSize)
-	log.Printf("【SyncTable】动态批次: %s.%s -> %d 行/批", sourceDB, sourceTable, batchSize)
+	common.LogDebug("【SyncTable】动态批次: %s.%s -> %d 行/批", sourceDB, sourceTable, batchSize)
 
 	// 仅同步结构
 	if batchSize == 0 {
@@ -187,7 +188,7 @@ func (e *SyncEngine) SyncTableForTarget(ctx context.Context, reader *MySQLReader
 	publishFn func(string, string, string),
 	onTableComplete func(taskID, targetTable, sourceTable, status string)) *SyncTableResult {
 
-	log.Printf("【SyncTableForTarget】开始同步: %s.%s -> %s.%s, batchSize=%d", sourceDB, sourceTable, targetDB, targetTable, batchSize)
+	common.LogDebug("【SyncTableForTarget】开始同步: %s.%s -> %s.%s, batchSize=%d", sourceDB, sourceTable, targetDB, targetTable, batchSize)
 
 	// 单表超时
 	if tableTimeoutMin > 0 {
@@ -199,39 +200,60 @@ func (e *SyncEngine) SyncTableForTarget(ctx context.Context, reader *MySQLReader
 	tableKey := TableKey(sourceDB, sourceTable)
 	result := &SyncTableResult{Database: sourceDB, Table: sourceTable}
 
-	columns, err := reader.GetColumns(ctx, sourceDB, sourceTable)
-	if err != nil {
-		log.Printf("【SyncTableForTarget】❌ 获取列信息失败: %v", err)
-		result.Error = fmt.Errorf("获取列信息失败: %w", err)
+	// 前置校验：目标表必须存在，否则空源表情况下会因 ReadBatch 返回 0 行而直接“完成”，造成假成功
+	if exists, chkErr := writer.TableExists(ctx, targetDB, targetTable); chkErr != nil {
+		common.LogError("【SyncTableForTarget】❌ 检查目标表存在性失败: %v", chkErr)
+		result.Error = fmt.Errorf("检查目标表存在性失败: %w", chkErr)
+		e.progressMgr.FailTargetTable(taskID, targetID, tableKey, chkErr.Error())
+		e.notifyTableFinished(taskID, targetTable, sourceTable, "failed", result.Error, publishFn, onTableComplete)
+		return result
+	} else if !exists {
+		msg := fmt.Sprintf("目标表 %s.%s 不存在", targetDB, targetTable)
+		common.LogError("【SyncTableForTarget】❌ %s", msg)
+		result.Error = fmt.Errorf("%s", msg)
+		e.progressMgr.FailTargetTable(taskID, targetID, tableKey, msg)
+		e.notifyTableFinished(taskID, targetTable, sourceTable, "failed", result.Error, publishFn, onTableComplete)
 		return result
 	}
-	log.Printf("【SyncTableForTarget】获取到 %d 列: %v", len(columns), columns)
+
+	columns, err := reader.GetColumns(ctx, sourceDB, sourceTable)
+	if err != nil {
+		common.LogError("【SyncTableForTarget】❌ 获取列信息失败: %v", err)
+		result.Error = fmt.Errorf("获取列信息失败: %w", err)
+		e.progressMgr.FailTargetTable(taskID, targetID, tableKey, err.Error())
+		e.notifyTableFinished(taskID, targetTable, sourceTable, "failed", result.Error, publishFn, onTableComplete)
+		return result
+	}
+	common.LogDebug("【SyncTableForTarget】获取到 %d 列: %v", len(columns), columns)
 
 	syncColumns := filterColumns(columns, fields)
 	colNames := make([]string, len(syncColumns))
 	for i, c := range syncColumns {
 		colNames[i] = c.Name
 	}
-	log.Printf("【SyncTableForTarget】过滤后列数: %d, 字段过滤参数: %v", len(syncColumns), fields)
+	common.LogDebug("【SyncTableForTarget】过滤后列数: %d, 字段过滤参数: %v", len(syncColumns), fields)
 
 	totalRows, err := reader.GetRowCount(ctx, sourceDB, sourceTable)
 	if err != nil {
-		log.Printf("【SyncTableForTarget】❌ 获取行数失败: %v", err)
+		common.LogError("【SyncTableForTarget】❌ 获取行数失败: %v", err)
 		result.Error = fmt.Errorf("获取行数失败: %w", err)
+		e.progressMgr.FailTargetTable(taskID, targetID, tableKey, err.Error())
+		e.notifyTableFinished(taskID, targetTable, sourceTable, "failed", result.Error, publishFn, onTableComplete)
 		return result
 	}
 	result.TotalRows = totalRows
-	log.Printf("【SyncTableForTarget】源表总行数: %d", totalRows)
+	common.LogDebug("【SyncTableForTarget】源表总行数: %d", totalRows)
 
 	e.progressMgr.StartTargetTable(taskID, targetID, tableKey, totalRows)
 
 	// 动态计算批次大小
 	batchSize = reader.EstimateBatchSize(ctx, sourceDB, sourceTable, batchSize)
-	log.Printf("【SyncTableForTarget】动态批次: %s.%s -> %d 行/批", sourceDB, sourceTable, batchSize)
+	common.LogDebug("【SyncTableForTarget】动态批次: %s.%s -> %d 行/批", sourceDB, sourceTable, batchSize)
 
 	if batchSize == 0 {
 		result.SyncedRows = 0
 		e.progressMgr.CompleteTargetTable(taskID, targetID, tableKey)
+		e.notifyTableFinished(taskID, targetTable, sourceTable, "completed", nil, publishFn, onTableComplete)
 		return result
 	}
 
@@ -248,54 +270,70 @@ func (e *SyncEngine) SyncTableForTarget(ctx context.Context, reader *MySQLReader
 
 		rows, err := reader.ReadBatch(ctx, sourceDB, sourceTable, colNames, offset, batchSize)
 		if err != nil {
-			log.Printf("【SyncTableForTarget】❌ 读取数据失败 (offset=%d): %v", offset, err)
+			common.LogError("【SyncTableForTarget】❌ 读取数据失败 (offset=%d): %v", offset, err)
 			result.Error = fmt.Errorf("读取数据失败 (offset=%d): %w", offset, err)
 			result.SyncedRows = syncedRows
 			e.progressMgr.FailTargetTable(taskID, targetID, tableKey, err.Error())
+			e.notifyTableFinished(taskID, targetTable, sourceTable, "failed", result.Error, publishFn, onTableComplete)
 			return result
 		}
 
 		if len(rows) == 0 {
-			log.Printf("【SyncTableForTarget】读取完毕，无更多数据")
+			common.LogDebug("【SyncTableForTarget】读取完毕，无更多数据")
 			break
 		}
-		log.Printf("【SyncTableForTarget】读取到 %d 行 (offset=%d)", len(rows), offset)
+		common.LogDebug("【SyncTableForTarget】读取到 %d 行 (offset=%d)", len(rows), offset)
 
 		if err := writer.BatchInsert(ctx, targetDB, targetTable, colNames, rows); err != nil {
-			log.Printf("【SyncTableForTarget】❌ 写入数据失败 (offset=%d): %v", offset, err)
+			common.LogError("【SyncTableForTarget】❌ 写入数据失败 (offset=%d): %v", offset, err)
 			result.Error = fmt.Errorf("写入数据失败 (offset=%d): %w", offset, err)
 			result.SyncedRows = syncedRows
 			e.progressMgr.FailTargetTable(taskID, targetID, tableKey, err.Error())
+			e.notifyTableFinished(taskID, targetTable, sourceTable, "failed", result.Error, publishFn, onTableComplete)
 			return result
 		}
-		log.Printf("【SyncTableForTarget】已写入 %d 行（累计 %d/%d）", len(rows), syncedRows+int64(len(rows)), totalRows)
+		common.LogDebug("【SyncTableForTarget】已写入 %d 行（累计 %d/%d）", len(rows), syncedRows+int64(len(rows)), totalRows)
 
 		syncedRows += int64(len(rows))
 		offset += batchSize
 		e.progressMgr.UpdateTargetTableProgress(taskID, targetID, tableKey, syncedRows)
 	}
 
-	log.Printf("【SyncTableForTarget】✅ 表 %s.%s 同步完成，共同步 %d 行", sourceDB, sourceTable, syncedRows)
+	common.LogDebug("【SyncTableForTarget】✅ 表 %s.%s 同步完成，共同步 %d 行", sourceDB, sourceTable, syncedRows)
 	result.SyncedRows = syncedRows
 	e.progressMgr.CompleteTargetTable(taskID, targetID, tableKey)
+	e.notifyTableFinished(taskID, targetTable, sourceTable, "completed", nil, publishFn, onTableComplete)
+	return result
+}
 
-	// 发布用户可见的同步完成日志
-	status := "completed"
-	if result.Error != nil {
-		status = "failed"
-	}
+// notifyTableFinished 统一发布单表结束事件（日志 + table_status），避免错误分支遗漏导致“假成功”
+func (e *SyncEngine) notifyTableFinished(taskID, targetTable, sourceTable, status string, syncErr error,
+	publishFn func(string, string, string),
+	onTableComplete func(taskID, targetTable, sourceTable, status string)) {
 	if publishFn != nil {
-		if targetTable == sourceTable {
-			publishFn(taskID, "sync_data", fmt.Sprintf("同步表 %s 完成", targetTable))
+		var msg string
+		if status == "failed" {
+			reason := ""
+			if syncErr != nil {
+				reason = ": " + syncErr.Error()
+			}
+			if targetTable == sourceTable {
+				msg = fmt.Sprintf("同步表 %s 失败%s", targetTable, reason)
+			} else {
+				msg = fmt.Sprintf("同步表 %s（源表名：%s）失败%s", targetTable, sourceTable, reason)
+			}
 		} else {
-			publishFn(taskID, "sync_data", fmt.Sprintf("同步表 %s（源表名：%s）完成", targetTable, sourceTable))
+			if targetTable == sourceTable {
+				msg = fmt.Sprintf("同步表 %s 完成", targetTable)
+			} else {
+				msg = fmt.Sprintf("同步表 %s（源表名：%s）完成", targetTable, sourceTable)
+			}
 		}
+		publishFn(taskID, "sync_data", msg)
 	}
-	// 发布表状态事件
 	if onTableComplete != nil {
 		onTableComplete(taskID, targetTable, sourceTable, status)
 	}
-	return result
 }
 
 // SyncTablesParallelForTarget 并发同步多张表（带 per-target 进度）
@@ -319,6 +357,7 @@ func (e *SyncEngine) SyncTablesParallelForTarget(ctx context.Context, reader *My
 				Database: t.SourceDB, Table: t.SourceTable,
 				Error: ctx.Err(),
 			}
+			e.notifyTableFinished(taskID, t.TargetTable, t.SourceTable, "failed", ctx.Err(), publishFn, onTableComplete)
 			continue
 		default:
 		}
@@ -332,6 +371,7 @@ func (e *SyncEngine) SyncTablesParallelForTarget(ctx context.Context, reader *My
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("[SyncEngine] panic syncing %s.%s: %v", task.SourceDB, task.SourceTable, r)
+					e.notifyTableFinished(taskID, task.TargetTable, task.SourceTable, "failed", fmt.Errorf("panic: %v", r), publishFn, onTableComplete)
 				}
 			}()
 

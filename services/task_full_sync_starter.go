@@ -78,12 +78,28 @@ func (s *FullSyncStarter) StartFullSync(ctx context.Context, taskID string, sour
 	strategyText := map[string]string{"drop": "删除重建", "truncate": "清空重建", "append": "追加写入", "structure_only": "仅结构"}[tableExistsStrategy]
 
 	s.publishLog(taskID, "sync_start", fmt.Sprintf("同步模式：全量同步 | 并发数：%d（自动） | 批次：动态 | 表策略：%s", workers, strategyText))
-	s.publishLog(taskID, "sync_start", fmt.Sprintf("任务：%s | 数据库映射：%d 个 | 目标数：%d 个", task.Name, len(config.DatabaseMappings), len(targets)))
+	s.publishLog(taskID, "sync_start", fmt.Sprintf("任务：%s | 目标数：%d 个", task.Name, len(targets)))
 
-	// 统计总表数
+	// 收集每个目标的库表映射（支持多目标独立映射）
+	targetMappings := make(map[string][]DatabaseMapping) // targetID -> mappings
+	srcTablesByDB := make(map[string][]string)           // sourceDB -> [sourceTable…] 用于按库分组查外键
+	seenSrcTbl := make(map[string]bool)                  // 去重用，key 为 sourceDB.sourceTable
 	totalTables := 0
-	for _, db := range config.DatabaseMappings {
-		totalTables += len(db.Tables)
+
+	for _, target := range targets {
+		mappings := config.GetEffectiveMappings(target.ID)
+		targetMappings[target.ID] = mappings
+		for _, db := range mappings {
+			totalTables += len(db.Tables)
+			for _, tbl := range db.Tables {
+				k := TableKey(db.SourceDB, tbl.SourceTable)
+				if seenSrcTbl[k] {
+					continue
+				}
+				seenSrcTbl[k] = true
+				srcTablesByDB[db.SourceDB] = append(srcTablesByDB[db.SourceDB], tbl.SourceTable)
+			}
+		}
 	}
 	s.publishLog(taskID, "sync_start", fmt.Sprintf("共同步 %d 张表", totalTables))
 
@@ -110,34 +126,33 @@ func (s *FullSyncStarter) StartFullSync(ctx context.Context, taskID string, sour
 
 	reader := NewMySQLReader(sourceDB)
 
-	// Step 1: 构建表同步任务列表
-	var allTables []string
-	var syncTasks []TableSyncTask
-
-	for _, db := range config.DatabaseMappings {
-		common.LogInfo("【全量同步】  数据库: %s -> %s, tables=%d", db.SourceDB, db.TargetDB, len(db.Tables))
-		for _, tbl := range db.Tables {
-			tableKey := TableKey(db.SourceDB, tbl.SourceTable)
-			allTables = append(allTables, tableKey)
-			syncTasks = append(syncTasks, TableSyncTask{
-				SourceDB:    db.SourceDB,
-				SourceTable: tbl.SourceTable,
-				TargetDB:    db.TargetDB,
-				TargetTable: tbl.TargetTable,
-				Fields:      tbl.Columns,
-				BatchSize:   0, // 由 SyncEngine 动态计算
-			})
+	// 构建所有源的 tableKey 集合（用于进度初始化和 FK 分析）
+	var allTableKeys []string
+	seenKeys := make(map[string]bool)
+	for _, mappings := range targetMappings {
+		for _, db := range mappings {
+			for _, tbl := range db.Tables {
+				key := TableKey(db.SourceDB, tbl.SourceTable)
+				if !seenKeys[key] {
+					seenKeys[key] = true
+					allTableKeys = append(allTableKeys, key)
+				}
+			}
 		}
 	}
 
-	// 初始化表状态到 Redis
+	// 初始化表状态到 Redis（合并所有目标的表）
 	if s.tableStatusSvc != nil {
 		var tableInfos []TableStatusInfo
-		for _, t := range syncTasks {
-			tableInfos = append(tableInfos, TableStatusInfo{
-				SourceTable: t.SourceTable,
-				TargetTable: t.TargetTable,
-			})
+		for _, mappings := range targetMappings {
+			for _, db := range mappings {
+				for _, tbl := range db.Tables {
+					tableInfos = append(tableInfos, TableStatusInfo{
+						SourceTable: tbl.SourceTable,
+						TargetTable: tbl.TargetTable,
+					})
+				}
+			}
 		}
 		if err := s.tableStatusSvc.InitTaskTables(taskID, tableInfos); err != nil {
 			log.Printf("[FullSync] 初始化表状态失败: %v", err)
@@ -153,8 +168,8 @@ func (s *FullSyncStarter) StartFullSync(ctx context.Context, taskID string, sour
 			go func(t TargetInfo) {
 				defer wg.Done()
 				s.initTargetStructure(ctx, taskID, t, &config, sourceDSN)
-				s.progressMgr.InitTargetProgress(taskID, t.ID, t.Name, allTables)
-				for _, tbl := range allTables {
+				s.progressMgr.InitTargetProgress(taskID, t.ID, t.Name, allTableKeys)
+				for _, tbl := range allTableKeys {
 					s.progressMgr.CompleteTargetTable(taskID, t.ID, tbl)
 				}
 				s.progressMgr.CompleteTarget(taskID, t.ID)
@@ -165,30 +180,34 @@ func (s *FullSyncStarter) StartFullSync(ctx context.Context, taskID string, sour
 		return nil
 	}
 
-	// Step 2: 外键拓扑排序
+	// Step 2: 外键拓扑排序（按源库分组查外键，合并后使用 sourceDB.sourceTable 复合 key）
 	common.LogInfo("【全量同步】Step 2: 分析表依赖关系")
-	var tableNames []string
-	for _, db := range config.DatabaseMappings {
-		for _, tbl := range db.Tables {
-			tableNames = append(tableNames, tbl.SourceTable)
+	var allFKKeys []ForeignKeyInfo
+	var allSrcKeys []string
+	for srcDB, tbls := range srcTablesByDB {
+		fks, err := reader.GetForeignKeys(ctx, srcDB, tbls)
+		if err != nil {
+			common.LogWarn("【全量同步】⚠️ 获取源库 %s 外键信息失败: %v", srcDB, err)
+		}
+		for _, fk := range fks {
+			// MySQL InnoDB 外键限同库，父子表都属于 srcDB
+			allFKKeys = append(allFKKeys, ForeignKeyInfo{
+				ChildTable:  TableKey(srcDB, fk.ChildTable),
+				ParentTable: TableKey(srcDB, fk.ParentTable),
+			})
+		}
+		for _, t := range tbls {
+			allSrcKeys = append(allSrcKeys, TableKey(srcDB, t))
 		}
 	}
-	var firstSourceDB string
-	if len(config.DatabaseMappings) > 0 {
-		firstSourceDB = config.DatabaseMappings[0].SourceDB
-	}
-	fks, err := reader.GetForeignKeys(ctx, firstSourceDB, tableNames)
-	if err != nil {
-		common.LogWarn("【全量同步】⚠️ 获取外键信息失败: %v", err)
-	}
-	topo := AnalyzeForeignKeys(tableNames, fks)
+	topo := AnalyzeForeignKeys(allSrcKeys, allFKKeys)
 	if len(topo.Cycles) > 0 {
 		s.publishLog(taskID, "sync_data", fmt.Sprintf("检测到循环依赖: %v", topo.Cycles))
 	}
 
 	// Step 3: 初始化进度
 	for _, target := range targets {
-		s.progressMgr.InitTargetProgress(taskID, target.ID, target.Name, allTables)
+		s.progressMgr.InitTargetProgress(taskID, target.ID, target.Name, allTableKeys)
 	}
 
 	// 步骤：创建库表完成，开始同步数据
@@ -210,7 +229,7 @@ func (s *FullSyncStarter) StartFullSync(ctx context.Context, taskID string, sour
 				}
 			}()
 
-			if err := s.syncOneTarget(ctx, taskID, t, sourceDSN, &config, syncTasks, topo); err != nil {
+			if err := s.syncOneTarget(ctx, taskID, t, sourceDSN, &config, topo); err != nil {
 				common.LogError("【全量同步】❌ 目标 %s 同步失败: %v", t.Name, err)
 				s.progressMgr.FailTarget(taskID, t.ID)
 				errCh <- err
@@ -233,14 +252,17 @@ func (s *FullSyncStarter) StartFullSync(ctx context.Context, taskID string, sour
 	}
 
 	s.progressMgr.CompleteTask(taskID)
-	s.publishLog(taskID, "validate", fmt.Sprintf("全量同步完成，共同步 %d 个目标，%d 张表", len(targets), len(syncTasks)))
+	s.publishLog(taskID, "validate", fmt.Sprintf("全量同步完成，共同步 %d 个目标，%d 张表", len(targets), totalTables))
 	s.publishStep(taskID, "sync_data", "completed")
 	s.publishStep(taskID, "completed", "completed")
 	return nil
 }
 
-// syncOneTarget 同步到单个目标
-func (s *FullSyncStarter) syncOneTarget(ctx context.Context, taskID string, target TargetInfo, sourceDSN string, config *TaskConfig, syncTasks []TableSyncTask, topo *TopologyResult) error {
+// syncOneTarget 同步到单个目标（使用每目标独立映射）
+func (s *FullSyncStarter) syncOneTarget(ctx context.Context, taskID string, target TargetInfo, sourceDSN string, config *TaskConfig, topo *TopologyResult) error {
+	// 获取此目标的独立库表映射
+	mappings := config.GetEffectiveMappings(target.ID)
+
 	// 连接目标库
 	targetDB, err := sql.Open("mysql", target.DSN)
 	if err != nil {
@@ -256,15 +278,33 @@ func (s *FullSyncStarter) syncOneTarget(ctx context.Context, taskID string, targ
 	reader := NewMySQLReader(sourceDB2)
 	writer := NewMySQLWriter(targetDB)
 
+	// 构建此目标的 syncTasks（每目标独立的库表映射）
+	var syncTasks []TableSyncTask
+	for _, db := range mappings {
+		common.LogInfo("【全量同步】  目标 %s 数据库: %s -> %s, tables=%d", target.Name, db.SourceDB, db.TargetDB, len(db.Tables))
+		for _, tbl := range db.Tables {
+			syncTasks = append(syncTasks, TableSyncTask{
+				SourceDB:    db.SourceDB,
+				SourceTable: tbl.SourceTable,
+				TargetDB:    db.TargetDB,
+				TargetTable: tbl.TargetTable,
+				Fields:      tbl.Columns,
+				BatchSize:   0, // 由 SyncEngine 动态计算
+			})
+		}
+	}
+
 	// 初始化目标库表结构（内部自动解析 DDL 外键依赖并拓扑排序）
 	initializer := NewSyncInitializer(reader, writer)
 	initializer.SetPublishFn(s.publishLog)
-	if err := initializer.InitAllTargets(ctx, config, target.DSN, taskID); err != nil {
+	if err := initializer.InitAllTargets(ctx, config, mappings, target.DSN, taskID); err != nil {
 		return fmt.Errorf("初始化目标 %s 失败: %w", target.Name, err)
 	}
 
 	// ─── 第三步：同步数据 ───
-	s.publishLog(taskID, "sync_data", "━━ 第三步：同步数据 ━━")
+	s.publishLog(taskID, "sync_data", fmt.Sprintf("━━ 目标 %s: 开始同步数据 ━━", target.Name))
+
+	var allResults []SyncTableResult
 
 	// 同步独立表（并发）
 	if len(topo.IndependentTables) > 0 {
@@ -272,37 +312,57 @@ func (s *FullSyncStarter) syncOneTarget(ctx context.Context, taskID string, targ
 		if workers < 2 {
 			workers = 2
 		}
+		independentSet := make(map[string]bool, len(topo.IndependentTables))
+		for _, k := range topo.IndependentTables {
+			independentSet[k] = true
+		}
 		var independentTasks []TableSyncTask
 		for _, t := range syncTasks {
-			for _, ind := range topo.IndependentTables {
-				if t.SourceTable == ind {
-					independentTasks = append(independentTasks, t)
-				}
+			if independentSet[TableKey(t.SourceDB, t.SourceTable)] {
+				independentTasks = append(independentTasks, t)
 			}
 		}
-		s.engine.SyncTablesParallelForTarget(ctx, reader, writer, independentTasks, workers, taskID, target.ID, config.SyncConfig.TableTimeoutMinutes, s.publishLog, s.publishTableStatus)
+		results := s.engine.SyncTablesParallelForTarget(ctx, reader, writer, independentTasks, workers, taskID, target.ID, config.SyncConfig.TableTimeoutMinutes, s.publishLog, s.publishTableStatus)
+		allResults = append(allResults, results...)
 	}
 
 	// 同步有外键依赖的表（按拓扑序串行）
 	if len(topo.OrderedTables) > 0 {
-		var orderedTasks []TableSyncTask
-		for _, ordered := range topo.OrderedTables {
-			for _, t := range syncTasks {
-				if t.SourceTable == ordered {
-					orderedTasks = append(orderedTasks, t)
-				}
-			}
+		// 构建 tableKey -> TableSyncTask 映射（注意可能多个 syncTask 映射至同一 tableKey当前模型下不会）
+		key2task := make(map[string]TableSyncTask, len(syncTasks))
+		for _, t := range syncTasks {
+			key2task[TableKey(t.SourceDB, t.SourceTable)] = t
 		}
-		for _, t := range orderedTasks {
+		for _, orderedKey := range topo.OrderedTables {
+			t, ok := key2task[orderedKey]
+			if !ok {
+				continue
+			}
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
 			default:
 			}
-			s.engine.SyncTableForTarget(ctx, reader, writer,
+			r := s.engine.SyncTableForTarget(ctx, reader, writer,
 				t.SourceDB, t.SourceTable, t.TargetDB, t.TargetTable,
 				t.Fields, t.BatchSize, taskID, target.ID, config.SyncConfig.TableTimeoutMinutes, s.publishLog, s.publishTableStatus)
+			if r != nil {
+				allResults = append(allResults, *r)
+			}
 		}
+	}
+
+	// 汇总失败统计
+	var failedCount int
+	for _, r := range allResults {
+		if r.Error != nil {
+			failedCount++
+		}
+	}
+	if failedCount > 0 {
+		s.publishLog(taskID, "sync_data", fmt.Sprintf("⚠️ 目标 %s: %d/%d 张表同步失败", target.Name, failedCount, len(allResults)))
+		s.progressMgr.CompleteTarget(taskID, target.ID)
+		return fmt.Errorf("目标 %s 有 %d 张表同步失败", target.Name, failedCount)
 	}
 
 	s.progressMgr.CompleteTarget(taskID, target.ID)
@@ -328,13 +388,15 @@ func (s *FullSyncStarter) initTargetStructure(ctx context.Context, taskID string
 	writer := NewMySQLWriter(targetDBConn)
 	initializer := NewSyncInitializer(reader, writer)
 	initializer.SetPublishFn(s.publishLog)
-	if err := initializer.InitAllTargets(ctx, config, target.DSN, taskID); err != nil {
+	mappings := config.GetEffectiveMappings(target.ID)
+	if err := initializer.InitAllTargets(ctx, config, mappings, target.DSN, taskID); err != nil {
 		log.Printf("[FullSync] 初始化目标 %s 结构失败: %v", target.Name, err)
 	}
 }
 
 func (s *FullSyncStarter) publishLog(taskID, category, message string) {
-	log.Printf("[Task:%s][%s] %s", taskID, category, message)
+	// 任务日志已经通过 event bus 派发到 SSE（前端可见）并由 TaskLogService 写入
+	// logs/tasks/<taskID>.log，这里不再镜像到 stdout／主日志，避免控制台刷屏
 	s.eventBus.Publish("task.log", map[string]interface{}{
 		"task_id":  taskID,
 		"category": category,

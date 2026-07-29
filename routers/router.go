@@ -30,6 +30,10 @@ func SetupRouter(application *app.AppContainer) *gin.Engine {
 	// API 路由组
 	v1 := r.Group("/api/v1")
 
+	// 概览页聚合接口（一次返回全部数据）
+	overviewAPI := api.NewOverviewAPI(application.OverviewSvc)
+	v1.GET("/overview", overviewAPI.GetOverview)
+
 	// 凭据管理
 	credentialAPI := api.NewCredentialAPI(application.CredentialSvc)
 	credentials := v1.Group("/credentials")

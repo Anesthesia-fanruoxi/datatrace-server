@@ -120,11 +120,19 @@ func (api *TaskAPI) Create(c *gin.Context) {
 		return
 	}
 
-	// 验证：至少选择一个表
+	// 验证：至少选择一个表（兼容多目标和旧格式）
 	if req.Config != nil {
 		totalTables := 0
-		for _, db := range req.Config.DatabaseMappings {
-			totalTables += len(db.Tables)
+		if len(req.Config.Targets) > 0 {
+			for _, tgt := range req.Config.Targets {
+				for _, db := range tgt.DatabaseMappings {
+					totalTables += len(db.Tables)
+				}
+			}
+		} else {
+			for _, db := range req.Config.DatabaseMappings {
+				totalTables += len(db.Tables)
+			}
 		}
 		if totalTables == 0 {
 			common.BadRequest(c, "请至少选择一个要同步的表")
@@ -149,11 +157,19 @@ func (api *TaskAPI) Update(c *gin.Context) {
 		return
 	}
 
-	// 验证：至少选择一个表
+	// 验证：至少选择一个表（兼容多目标和旧格式）
 	if req.Config != nil {
 		totalTables := 0
-		for _, db := range req.Config.DatabaseMappings {
-			totalTables += len(db.Tables)
+		if len(req.Config.Targets) > 0 {
+			for _, tgt := range req.Config.Targets {
+				for _, db := range tgt.DatabaseMappings {
+					totalTables += len(db.Tables)
+				}
+			}
+		} else {
+			for _, db := range req.Config.DatabaseMappings {
+				totalTables += len(db.Tables)
+			}
 		}
 		if totalTables == 0 {
 			common.BadRequest(c, "请至少选择一个要同步的表")

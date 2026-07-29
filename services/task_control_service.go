@@ -80,9 +80,13 @@ func (s *TaskControlService) Start(taskID string) error {
 		return fmt.Errorf("获取源库连接失败: %w", err)
 	}
 
-	// 解析配置获取目标 ID（优先用 task.TargetID，广播场景暂不支持）
-	targetIDs := []string{}
-	if task.TargetID != "" {
+	// 解析配置获取目标 ID（优先用 config.Targets，兼容旧数据用 task.TargetID）
+	var config TaskConfig
+	if task.Config != "" && task.Config != "{}" {
+		json.Unmarshal([]byte(task.Config), &config)
+	}
+	targetIDs := config.GetTargetIDs()
+	if len(targetIDs) == 0 && task.TargetID != "" {
 		targetIDs = []string{task.TargetID}
 	}
 	if len(targetIDs) == 0 {

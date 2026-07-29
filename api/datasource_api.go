@@ -102,11 +102,23 @@ func (api *DataSourceAPI) TestConnection(c *gin.Context) {
 		Username     string `json:"username"`
 		Password     string `json:"password"`
 		DatabaseName string `json:"database_name"`
+		CredentialID string `json:"credential_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		common.BadRequest(c, "参数错误: "+err.Error())
 		return
 	}
+
+	// 如果指定了凭据 ID，使用凭据中的账号密码
+	if req.CredentialID != "" {
+		if err := api.service.TestConnectionByCredential(req.Host, req.Port, req.CredentialID, req.DatabaseName); err != nil {
+			common.BadRequest(c, "连接测试失败: "+err.Error())
+			return
+		}
+		common.Success(c, gin.H{"message": "连接成功"})
+		return
+	}
+
 	if err := api.service.TestConnectionByPayload(req.Host, req.Port, req.Username, req.Password, req.DatabaseName); err != nil {
 		common.BadRequest(c, "连接测试失败: "+err.Error())
 		return

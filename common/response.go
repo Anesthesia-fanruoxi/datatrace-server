@@ -71,7 +71,7 @@ func PageSuccess(c *gin.Context, data interface{}, total int64, page, pageSize i
 
 // BadRequest 400 错误
 func BadRequest(c *gin.Context, message string) {
-	Error(c, 400, message)
+	ErrorWithStatus(c, http.StatusBadRequest, 400, message)
 }
 
 // Unauthorized 401 错误
@@ -86,10 +86,10 @@ func Forbidden(c *gin.Context, message string) {
 
 // NotFound 404 错误
 func NotFound(c *gin.Context, message string) {
-	Error(c, 404, message)
+	ErrorWithStatus(c, http.StatusNotFound, 404, message)
 }
 
 // InternalServerError 500 错误
 func InternalServerError(c *gin.Context, message string) {
-	Error(c, 500, message)
+	ErrorWithStatus(c, http.StatusInternalServerError, 500, message)
 }

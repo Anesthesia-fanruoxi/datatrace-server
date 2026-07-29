@@ -104,7 +104,9 @@ func (h *SSEHub) PublishJSON(topic string, event string, data interface{}) error
 }
 
 // Handler 返回 Gin SSE Handler，支持多 topic 订阅
-// 请求格式: GET /sse?topics=task:abc:detail,task:abc:progress
+// 请求格式:
+//   - 完整: GET /sse?topics=task:abc:detail,task:abc:progress
+//   - 简写: GET /sse?task_id=abc&topics=detail,progress,logs,table_status,step_status
 func (h *SSEHub) Handler() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		topicsParam := c.Query("topics")
@@ -113,8 +115,16 @@ func (h *SSEHub) Handler() gin.HandlerFunc {
 			return
 		}
 
-		// 解析 topic 列表
-		topics := splitTopics(topicsParam)
+		// 支持简写格式: task_id=xxx&topics=logs,detail,...
+		taskID := c.Query("task_id")
+		var topics []string
+		if taskID != "" {
+			for _, t := range splitTopics(topicsParam) {
+				topics = append(topics, "task:"+taskID+":"+t)
+			}
+		} else {
+			topics = splitTopics(topicsParam)
+		}
 		if len(topics) == 0 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "no valid topics"})
 			return

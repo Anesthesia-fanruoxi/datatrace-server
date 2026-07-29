@@ -21,11 +21,40 @@ func NewTaskService(db *gorm.DB) *TaskService {
 	return &TaskService{db: db}
 }
 
+// TargetConfig 单个目标的配置（库表映射完全独立）
+type TargetConfig struct {
+	TargetID         string            `json:"target_id"`
+	DatabaseMappings []DatabaseMapping `json:"database_mappings"`
+}
+
 // TaskConfig 任务配置（JSON 存储在 sync_tasks.config）
 type TaskConfig struct {
-	DatabaseMappings []DatabaseMapping `json:"database_mappings"`
+	DatabaseMappings []DatabaseMapping `json:"database_mappings,omitempty"` // 兼容旧数据
+	Targets          []TargetConfig    `json:"targets,omitempty"`           // 多目标（新格式）
 	SyncConfig       SyncConfig        `json:"sync_config"`
 	Runtime          RuntimeConfig     `json:"runtime"`
+}
+
+// GetEffectiveMappings 获取指定目标的库表映射（兼容旧数据）
+func (c *TaskConfig) GetEffectiveMappings(targetID string) []DatabaseMapping {
+	for _, t := range c.Targets {
+		if t.TargetID == targetID {
+			return t.DatabaseMappings
+		}
+	}
+	return c.DatabaseMappings // 回退到旧格式
+}
+
+// GetTargetIDs 获取所有目标 ID
+func (c *TaskConfig) GetTargetIDs() []string {
+	if len(c.Targets) > 0 {
+		ids := make([]string, len(c.Targets))
+		for i, t := range c.Targets {
+			ids[i] = t.TargetID
+		}
+		return ids
+	}
+	return nil
 }
 
 // RuntimeConfig 运行时性能参数
@@ -64,12 +93,13 @@ type SyncConfig struct {
 
 // CreateTaskRequest 创建任务请求
 type CreateTaskRequest struct {
-	Name     string      `json:"name" binding:"required"`
-	Mode     string      `json:"mode" binding:"required,oneof=full incremental full_incremental"`
-	SourceID string      `json:"source_id" binding:"required"`
-	TargetID string      `json:"target_id" binding:"required"`
-	Config   *TaskConfig `json:"config"`
-	Remark   string      `json:"remark"`
+	Name      string      `json:"name" binding:"required"`
+	Mode      string      `json:"mode" binding:"required,oneof=full incremental full_incremental"`
+	SourceID  string      `json:"source_id" binding:"required"`
+	TargetID  string      `json:"target_id"`  // 兼容单目标
+	TargetIDs []string    `json:"target_ids"` // 多目标
+	Config    *TaskConfig `json:"config"`
+	Remark    string      `json:"remark"`
 }
 
 // UpdateTaskRequest 更新任务请求
@@ -84,26 +114,49 @@ type UpdateTaskRequest struct {
 // UpdateTaskConfigRequest 更新任务配置请求（向导提交）
 type UpdateTaskConfigRequest struct {
 	SourceID         string            `json:"source_id"`
-	TargetID         string            `json:"target_id"`
-	DatabaseMappings []DatabaseMapping `json:"database_mappings"`
+	TargetID         string            `json:"target_id"`  // 兼容单目标
+	TargetIDs        []string          `json:"target_ids"` // 多目标
+	Targets          []TargetConfig    `json:"targets"`    // 多目标独立映射
 	SyncConfig       SyncConfig        `json:"sync_config"`
 	Runtime          RuntimeConfig     `json:"runtime"`
+	DatabaseMappings []DatabaseMapping `json:"database_mappings"` // 兼容旧格式
 }
 
 // Create 创建任务
 func (s *TaskService) Create(req *CreateTaskRequest) (*models.SyncTask, error) {
+	// 兼容 TargetIDs 和 TargetID
+	targetID := req.TargetID
+	if len(req.TargetIDs) > 0 {
+		targetID = req.TargetIDs[0]
+	}
+	if targetID == "" {
+		return nil, fmt.Errorf("未指定目标数据源")
+	}
+
 	configJSON := "{}"
 	if req.Config != nil {
-		// 统计 tables 数量（用于调试）
 		totalTables := 0
-		for _, db := range req.Config.DatabaseMappings {
-			for _, t := range db.Tables {
-				if t.Selected {
-					totalTables++
+		if len(req.Config.Targets) > 0 {
+			for _, tgt := range req.Config.Targets {
+				for _, db := range tgt.DatabaseMappings {
+					for _, t := range db.Tables {
+						if t.Selected {
+							totalTables++
+						}
+					}
 				}
 			}
+			log.Printf("【CreateTask】多目标配置: %d 个目标，共 %d 个表（selected）", len(req.Config.Targets), totalTables)
+		} else {
+			for _, db := range req.Config.DatabaseMappings {
+				for _, t := range db.Tables {
+					if t.Selected {
+						totalTables++
+					}
+				}
+			}
+			log.Printf("【CreateTask】单目标配置: %d 个数据库映射，共 %d 个表（selected）", len(req.Config.DatabaseMappings), totalTables)
 		}
-		log.Printf("【CreateTask】接收到配置: %d 个数据库映射，共 %d 个表（selected）", len(req.Config.DatabaseMappings), totalTables)
 
 		data, err := json.Marshal(req.Config)
 		if err != nil {
@@ -111,22 +164,16 @@ func (s *TaskService) Create(req *CreateTaskRequest) (*models.SyncTask, error) {
 		}
 		configJSON = string(data)
 		log.Printf("【CreateTask】配置已序列化，长度: %d 字符", len(configJSON))
-		// 打印前 500 字符（用于调试）
-		if len(configJSON) > 500 {
-			log.Printf("【CreateTask】配置内容（前 500 字符）: %s...", configJSON[:500])
-		} else {
-			log.Printf("【CreateTask】配置内容: %s", configJSON)
-		}
 	}
 
 	task := &models.SyncTask{
 		ID:        uuid.New().String(),
 		Name:      req.Name,
 		SourceID:  req.SourceID,
-		TargetID:  req.TargetID,
+		TargetID:  targetID,
 		SyncMode:  req.Mode,
 		Remark:    req.Remark,
-		Status:    "configured", // 创建时已有配置
+		Status:    "configured",
 		IsRunning: false,
 		Config:    configJSON,
 	}
@@ -201,6 +248,12 @@ func (s *TaskService) Delete(id string) error {
 	var task models.SyncTask
 	if err := s.db.First(&task, "id = ?", id).Error; err != nil {
 		return fmt.Errorf("任务不存在: %w", err)
+	}
+
+	// 状态不一致时自动修正 is_running
+	if task.IsRunning && task.Status != "running" {
+		s.db.Model(&task).Update("is_running", false)
+		task.IsRunning = false
 	}
 
 	if task.IsRunning {
@@ -286,8 +339,8 @@ func (s *TaskService) GetConfigView(id string) (*ConfigViewResult, error) {
 	if task.Config != "" && task.Config != "{}" {
 		json.Unmarshal([]byte(task.Config), &config)
 	}
-	allTargetIDs := []string{}
-	if task.TargetID != "" {
+	allTargetIDs := config.GetTargetIDs()
+	if len(allTargetIDs) == 0 && task.TargetID != "" {
 		allTargetIDs = []string{task.TargetID}
 	}
 
@@ -327,24 +380,34 @@ func (s *TaskService) UpdateConfig(id string, req *UpdateTaskConfigRequest) erro
 		return fmt.Errorf("任务正在运行中，无法修改配置")
 	}
 
+	// 兼容 TargetIDs 和 TargetID
+	targetID := req.TargetID
+	if len(req.TargetIDs) > 0 {
+		targetID = req.TargetIDs[0]
+	}
+
 	// 更新 DB 字段
 	updates := map[string]interface{}{}
 	if req.SourceID != "" {
 		updates["source_id"] = req.SourceID
 	}
-	if req.TargetID != "" {
-		updates["target_id"] = req.TargetID
+	if targetID != "" {
+		updates["target_id"] = targetID
 	}
 	if req.SyncConfig.ErrorStrategy != "" {
 		updates["sync_mode"] = "incremental" // 根据策略判断，或让前端传
 	}
 	updates["updated_at"] = time.Now()
 
-	// 只把属于 config JSON 的字段序列化
+	// 构建 config JSON（支持多目标和单目标格式）
 	configObj := TaskConfig{
-		DatabaseMappings: req.DatabaseMappings,
-		SyncConfig:       req.SyncConfig,
-		Runtime:          req.Runtime,
+		Targets:    req.Targets,
+		SyncConfig: req.SyncConfig,
+		Runtime:    req.Runtime,
+	}
+	// 如果没有多目标配置，使用旧的单目标格式（向后兼容）
+	if len(req.Targets) == 0 {
+		configObj.DatabaseMappings = req.DatabaseMappings
 	}
 	configJSON, err := json.Marshal(configObj)
 	if err != nil {
@@ -353,7 +416,8 @@ func (s *TaskService) UpdateConfig(id string, req *UpdateTaskConfigRequest) erro
 	updates["config"] = string(configJSON)
 
 	// 如果有配置，标记为 configured
-	if len(req.DatabaseMappings) > 0 {
+	hasConfig := len(req.DatabaseMappings) > 0 || len(req.Targets) > 0
+	if hasConfig {
 		updates["status"] = "configured"
 	}
 

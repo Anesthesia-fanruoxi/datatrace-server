@@ -41,6 +41,7 @@ type AppContainer struct {
 	HealthCheckSvc  *services.HealthCheckService
 	TaskLogSvc      *services.TaskLogService
 	TableStatusSvc  *services.TaskTableStatusService
+	OverviewSvc     *services.OverviewService
 
 	// 生命周期
 	cancel context.CancelFunc
@@ -129,6 +130,9 @@ func (app *AppContainer) initServices() {
 
 	// 健康检查服务
 	app.HealthCheckSvc = services.NewHealthCheckService(app.DB, app.DataSourceSvc, app.EventBus)
+
+	// 概览聚合服务（依赖 TaskSvc / DataSourceSvc / HealthCheckSvc）
+	app.OverviewSvc = services.NewOverviewService(app.TaskSvc, app.DataSourceSvc, app.HealthCheckSvc)
 }
 
 // registerBridges 注册 EventBus → SSEHub 桥接
